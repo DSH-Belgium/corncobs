@@ -47,15 +47,17 @@
 //! 
 //! - Encoding
 //!   - [`encode_buf`]: from one slice to another; efficient, but requires 2x
-//!   the available RAM.
+//!     the available RAM.
+//!   - [`encode_in_place`]: in-place in a slice; somewhat slower, but re-uses
+//!     the same buffer. Still faster than [`encode_iter`].
 //!   - [`encode_iter`]: incremental, using an iterator; somewhat slower, but
-//!   requires no additional memory. (This can be useful in a serial interrupt
-//!   handler.)
+//!     requires no additional memory. (This can be useful in a serial interrupt
+//!     handler.)
 //! - Decoding
 //!   - [`decode_buf`]: from one slice to another; efficient, but requires 2x
-//!   the available RAM.
+//!     the available RAM.
 //!   - [`decode_in_place`]: in-place in a slice; nearly as efficient, but
-//!   overwrites incoming data.
+//!     overwrites incoming data.
 //!
 //! ## Design decisions / tradeoffs
 //!
@@ -174,18 +176,40 @@ pub const fn max_encoded_len(raw_len: usize) -> usize {
     raw_len + overhead + 1
 }
 
-/// Encodes the message `bytes` into the buffer `output`. Returns the number of
-/// bytes used in `output`, which also happens to be the index of the first zero
-/// byte.
+/// Compute the exact encoded length for the message `bytes`.
+///
+/// NOTE: You should always use `max_encoded_len()` to determine buffer sizes.
+/// The difference in size is minimal, but `max_encoded_len()` is much faster.
+/// More importantly, the encoding functions will panic in debug builds
+/// if the provided buffer is smaller than the value of `max_encoded_len()`.
+pub fn exact_encoded_len(bytes: &[u8]) -> usize {
+    let mut len = 1; // terminating ZERO byte
+    let mut prev_run_was_maximal = false;
+
+    // Same algorothm as encode_buf(), stripped to only count the output length.
+    for run in bytes.split(|&b| b == ZERO) {
+        len += usize::from(prev_run_was_maximal);
+        prev_run_was_maximal = !run.is_empty()
+            && run.len().is_multiple_of(MAX_RUN);
+        len += run.len() + run.len().div_ceil(MAX_RUN).max(1);
+    }
+
+    len
+}
+
+/// Encodes the message `bytes` into the buffer `output`.
+///
+/// Returns the number of bytes used in `output`, which also happens to be the
+/// index of the first zero byte.
 ///
 /// Bytes in `output` after the part that gets used are left unchanged.
 ///
-/// `output` must be large enough to receive the encoded form, which is
-/// `max_encoded_len(bytes.len())` worst-case.
+/// `output` must be large enough to receive the worst-case encoded form of any
+/// input of length `bytes.len()`.
 ///
 /// # Panics
 ///
-/// If `output` is too small to contain the encoded form of `input`.
+/// If `buf.len() < max_encoded_len(input_len)`.
 pub fn encode_buf(bytes: &[u8], mut output: &mut [u8]) -> usize {
     // We'll panic if the precondition is violated regardless, but this makes
     // the error a bit easier to spot in tests:
@@ -237,6 +261,113 @@ pub fn encode_buf(bytes: &[u8], mut output: &mut [u8]) -> usize {
     // terminating byte goes at the new start:
     output[0] = 0;
     orig_size - (output.len() - 1)
+}
+
+/// Encodes the message `buf[..input_len]` in-place in the same buffer.
+///
+/// Returns the length of the encoded message, including the terminating zero
+/// byte.
+///
+/// This function is useful when you want to avoid a separate output buffer.
+/// However, it will usually be slower than using `encode_buf()` with a separate
+/// buffer.
+///
+/// The encoded message is always bigger than `input_len`. You must make sure
+/// the buffer is large enough to hold the worst-case encoded form of any input
+/// of length `input_len`.
+///
+/// # Panics
+///
+/// If `buf.len() < max_encoded_len(input_len)`.
+pub fn encode_in_place(buf: &mut [u8], input_len: usize) -> usize {
+    // We'll panic if the precondition is violated regardless, but this makes
+    // the error a bit easier to spot in tests:
+    debug_assert!(buf.len() >= max_encoded_len(input_len));
+
+    let encoded_len = exact_encoded_len(&buf[..input_len]);
+    debug_assert!(
+        encoded_len <= max_encoded_len(input_len),
+        "encoded_len: {encoded_len}, max_encoded_len: {}",
+        max_encoded_len(input_len)
+    );
+
+    // Start reading at the end of input, and writing at the end of output.
+    let mut read_pos = input_len;
+    let mut write_pos = encoded_len;
+
+    // Trailing zero byte.
+    write_pos -= 1;
+    buf[write_pos] = ZERO;
+
+    // Find and encode the last (rightmost) run of non-zero bytes.
+    let run_start = rscan_run_start(buf, read_pos);
+    let run_len = read_pos - run_start;
+    encode_run_backward(buf, run_start, run_len, &mut write_pos);
+    read_pos = run_start;
+
+    // Process remaining runs from right to left.
+    while read_pos > 0 {
+        read_pos -= 1; // skip the zero byte between runs
+
+        let run_start = rscan_run_start(buf, read_pos);
+        let run_len = read_pos - run_start;
+
+        // If the last chunk of this run is MAX_RUN, we need to glue an explicit
+        // zero after it. Since we're encoding back to front, we do this first.
+        if run_len > 0 && run_len.is_multiple_of(MAX_RUN) {
+            write_pos -= 1;
+            buf[write_pos] = encode_len(0);
+        }
+
+        encode_run_backward(buf, run_start, run_len, &mut write_pos);
+        read_pos = run_start;
+    }
+
+    debug_assert_eq!(write_pos, 0);
+    encoded_len
+}
+
+/// Find the start of the non-zero run which ends at `buf[end]`.
+///
+/// Returns the index of the first non-zero byte in the run.
+///
+/// The run can be longer than MAX_RUN: it must still be chopped into chunks.
+fn rscan_run_start(buf: &[u8], end: usize) -> usize {
+    match buf[..end].iter().rposition(|&x| x == ZERO) {
+        Some(i) => i + 1,
+        None => 0,
+    }
+}
+
+/// Encode a single run of `run_len` non-zero bytes.
+///
+/// The run will be chopped into chunks of at most MAX_RUN length,
+/// aligned to the start of the run.
+///
+/// Each chunk will be prefixed with the encoded chunk length.
+fn encode_run_backward(
+    buf: &mut [u8],
+    run_start: usize,
+    run_len: usize,
+    wpos: &mut usize,
+) {
+    // Empty runs still need to encode the zero/marker byte preceeding it.
+    if run_len == 0 {
+        *wpos -= 1;
+        buf[*wpos] = encode_len(0);
+        return;
+    }
+
+    for offset_start in (0..run_len).step_by(MAX_RUN).rev() {
+        let offset_end = (offset_start + MAX_RUN).clamp(0, run_len);
+        let chunk_len = offset_end - offset_start;
+        let chunk_start = run_start + offset_start;
+        let chunk_end = run_start + offset_end;
+        *wpos -= chunk_len;
+        buf.copy_within(chunk_start..chunk_end, *wpos);
+        *wpos -= 1;
+        buf[*wpos] = encode_len(chunk_len);
+    }
 }
 
 /// Encodes `bytes` into the vector `output`. This is a convenience for cases

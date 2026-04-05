@@ -21,7 +21,23 @@ static FIXTURES: &[(&[u8], &[u8])] = &[
         &[0x11, 0x00, 0x00, 0x00],
         &[0x02, 0x11, 0x01, 0x01, 0x01, 0x00],
     ),
+    (
+        &[0xFF, 0x1D, 0x0A],
+        &[0x04, 0xFF, 0x1D, 0x0A, 0x00],
+    ),
+    convert_long_fixture(&LONG_FIXTURE_1),
+    convert_long_fixture(&LONG_FIXTURE_2),
+    convert_long_fixture(&LONG_FIXTURE_3),
+    convert_long_fixture(&LONG_FIXTURE_4),
 ];
+
+const fn convert_long_fixture<const IN: usize, const OUT: usize>(
+    fixture: &([u8; IN], [u8; OUT]),
+) -> (&[u8], &[u8]) {
+    let (raw, encoded) = fixture;
+    (raw, encoded)
+
+}
 
 #[test]
 fn check_fixtures() {
@@ -60,7 +76,7 @@ const LONG_FIXTURE_1: ([u8; 254], [u8; 254 + 2]) = {
     // Output should be:
     // FF 01 02 ... FD FE 00
     let mut output = [0; 254 + 2];
-    output[0] = 0xFf;
+    output[0] = 0xFF;
     let mut i = 0;
     while i < 254 {
         output[i + 1] = (i as u8) + 1;
@@ -302,7 +318,7 @@ fn fixture_round_trip() {
 }
 
 #[test]
-fn fixture_round_trip_in_place() {
+fn fixture_round_trip_decode_in_place() {
     for (i, (input, _)) in FIXTURES.iter().enumerate() {
         let mut encoded = vec![0; max_encoded_len(input.len())];
         let n = encode_buf(input, &mut encoded);
@@ -312,4 +328,44 @@ fn fixture_round_trip_in_place() {
 
         assert_eq!(&encoded[..n], *input, "mismatch in case {}", i);
     }
+}
+
+#[test]
+fn fixture_encode_in_place() {
+    for (i, &(input, output)) in FIXTURES.iter().enumerate() {
+        eprintln!("-- fixture {} --", i);
+        let mut buf = vec![0u8; max_encoded_len(input.len())];
+        buf[..input.len()].copy_from_slice(input);
+        let n = encode_in_place(&mut buf, input.len());
+
+        assert_eq!(&buf[..n], output, "mismatch in case {}", i);
+    }
+}
+
+#[test]
+fn long_fixture_encode_in_place() {
+    let fixtures: &[(&'static [u8], &'static [u8])] = &[
+        (&LONG_FIXTURE_1.0, &LONG_FIXTURE_1.1),
+        (&LONG_FIXTURE_2.0, &LONG_FIXTURE_2.1),
+        (&LONG_FIXTURE_3.0, &LONG_FIXTURE_3.1),
+        (&LONG_FIXTURE_4.0, &LONG_FIXTURE_4.1),
+    ];
+    for (i, &(input, expected)) in fixtures.iter().enumerate() {
+        let mut buf = vec![0u8; max_encoded_len(input.len())];
+        buf[..input.len()].copy_from_slice(input);
+
+        let n = encode_in_place(&mut buf, input.len());
+
+        for (j, (&ab, &eb)) in buf[..n].iter().zip(expected).enumerate() {
+            assert_eq!(ab, eb, "mismatch at fixture {} index {}", i, j);
+        }
+        assert_eq!(n, expected.len(), "length mismatch in case {}", i);
+    }
+}
+
+#[test]
+#[should_panic]
+fn encode_in_place_panics_if_buffer_too_small() {
+    let mut buf = [0x42; 2]; // needs 3 bytes for 1-byte input
+    encode_in_place(&mut buf, 1);
 }
